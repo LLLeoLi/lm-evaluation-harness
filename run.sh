@@ -100,4 +100,99 @@ done
 
 wait
 
+# ============ 汇总: 把所有模型每个 task 的主指标拢到一张表 ============
+SUMMARY_CSV="${CKPT_ROOT}/eval_summary_${DATE_TAG}.csv"
+SUMMARY_JSON="${CKPT_ROOT}/eval_summary_${DATE_TAG}.json"
+
+python - "${SUMMARY_CSV}" "${SUMMARY_JSON}" "${EVAL_SUBDIR}" "${MODELS[@]}" <<'PY'
+import csv, json, os, sys
+
+csv_path, json_path, eval_subdir, *model_paths = sys.argv[1:]
+
+# 选主指标的优先级 (lm-eval 不同 task 字段名不一样)
+PREFERRED = [
+    "acc,none", "acc_norm,none",
+    "exact_match,strict-match", "exact_match,flexible-extract",
+    "mc2,none", "em,none",
+]
+
+def pick_primary(metrics):
+    for k in PREFERRED:
+        v = metrics.get(k)
+        if isinstance(v, (int, float)):
+            return k, v
+    # 兜底: 第一个非 stderr 的数值
+    for k, v in metrics.items():
+        if k.endswith("_stderr,none") or "stderr" in k:
+            continue
+        if isinstance(v, (int, float)):
+            return k, v
+    return None, None
+
+rows = []
+for mp in model_paths:
+    name = os.path.basename(mp.rstrip("/"))
+    eval_dir = os.path.join(mp, eval_subdir)
+    if not os.path.isdir(eval_dir):
+        continue
+    for root, _, files in os.walk(eval_dir):
+        # 跳 logs/ 和 samples_*.jsonl
+        if os.path.basename(root) == "logs":
+            continue
+        for fn in files:
+            if not fn.endswith(".json") or "samples" in fn:
+                continue
+            fp = os.path.join(root, fn)
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as e:
+                print(f"[summary] WARN: 读取失败 {fp}: {e}")
+                continue
+            if not isinstance(data, dict):
+                continue
+            results = data.get("results")
+            if not isinstance(results, dict):
+                continue
+            # split: 用 fn 主名 (results_temp0.json -> temp0); 若 lm_eval 把 output_path 当目录,
+            # 取 eval_dir 下第一级目录名作为 split
+            rel = os.path.relpath(fp, eval_dir)
+            top = rel.split(os.sep)[0]
+            if top.endswith(".json"):
+                split = top[:-5].removeprefix("results_")
+            else:
+                split = top.removeprefix("results_")
+            for task, metrics in results.items():
+                if not isinstance(metrics, dict):
+                    continue
+                metric_key, value = pick_primary(metrics)
+                if value is None:
+                    continue
+                rows.append({
+                    "model": name,
+                    "split": split,
+                    "task": task,
+                    "metric": metric_key,
+                    "value": float(value),
+                })
+
+rows.sort(key=lambda r: (r["model"], r["split"], r["task"]))
+
+with open(csv_path, "w", newline="", encoding="utf-8") as f:
+    w = csv.writer(f)
+    w.writerow(["model", "split", "task", "metric", "value"])
+    for r in rows:
+        w.writerow([r["model"], r["split"], r["task"], r["metric"], f"{r['value']:.4f}"])
+
+with open(json_path, "w", encoding="utf-8") as f:
+    json.dump(rows, f, indent=2, ensure_ascii=False)
+
+print("\n========== Eval Summary ==========")
+print(f"{'model':<55} {'split':<14} {'task':<25} {'metric':<30} {'value':>8}")
+for r in rows:
+    print(f"{r['model']:<55} {r['split']:<14} {r['task']:<25} {r['metric']:<30} {r['value']:>8.4f}")
+print(f"\n[summary] CSV  → {csv_path}")
+print(f"[summary] JSON → {json_path}")
+PY
+
 echo "[run] 全部完成! 结果在各模型目录下 ${EVAL_SUBDIR}/"
