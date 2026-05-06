@@ -1,9 +1,5 @@
-#!/bin/bash
-# ==============================================================================
-# run.sh — lm-evaluation-harness 通用能力评测
-#   每个训练产物自动选 step 号最大的 checkpoint, 跑 lm_eval (temp=0 一次 + temp=1 三次)
-# ==============================================================================
 set +e
+set -u
 
 ENTRY_DIR="/opt/tiger/entry"
 LME_DIR="${ENTRY_DIR}/lm-evaluation-harness"
@@ -46,9 +42,37 @@ run_one() {
         > "${OUT_DIR}/logs/${SUFFIX}.log" 2>&1
 }
 
-for i in "${!MODELS[@]}"; do
-    MODEL_PATH="${MODELS[$i]}"
-    GPU_ID=$(( i % BATCH_SIZE ))
+run_model_on_gpu() {
+    local EVAL_PATH=$1 GPU=$2 NAME=$3 ARGS=$4 OUT_DIR=$5
+    echo ">>> [GPU ${GPU}] ${NAME} → $(basename ${EVAL_PATH})"
+    run_lm  "${ARGS}" "${OUT_DIR}" "${NAME}" "${GPU}"
+    run_gen 0.0 gsm8k_temp0      "${ARGS}" "${OUT_DIR}" "${NAME}" "${GPU}"
+    run_gen 1.0 gsm8k_temp1_run1 "${ARGS}" "${OUT_DIR}" "${NAME}" "${GPU}"
+    run_gen 1.0 gsm8k_temp1_run2 "${ARGS}" "${OUT_DIR}" "${NAME}" "${GPU}"
+    run_gen 1.0 gsm8k_temp1_run3 "${ARGS}" "${OUT_DIR}" "${NAME}" "${GPU}"
+    echo "<<< [GPU ${GPU}] ${NAME} 完成"
+}
+
+declare -A GPU_PID
+for ((g=0; g<NUM_GPUS; g++)); do GPU_PID[$g]=0; done
+
+acquire_gpu() {
+    while true; do
+        for ((g=0; g<NUM_GPUS; g++)); do
+            local pid=${GPU_PID[$g]}
+            if [ "$pid" = "0" ] || ! kill -0 "$pid" 2>/dev/null; then
+                GPU_PID[$g]=0
+                echo $g
+                return
+            fi
+        done
+        wait -n 2>/dev/null || sleep 2
+    done
+}
+
+LAUNCH_STAGGER="${LAUNCH_STAGGER:-5}"  # 启动间隔, 错开 ckpt shard 加载峰值
+
+for MODEL_PATH in "${MODELS[@]}"; do
     NAME=$(basename "${MODEL_PATH}")
 
     EVAL_PATH=""; LATEST=-1
@@ -60,7 +84,10 @@ for i in "${!MODELS[@]}"; do
         (( step > LATEST )) && LATEST=$step && EVAL_PATH="$c"
     done
     shopt -u nullglob
-    [ -z "${EVAL_PATH}" ] && { echo "[run] WARN: ${NAME} 无 checkpoint, 跳过"; continue; }
+    if [ -z "${EVAL_PATH}" ]; then
+        echo "[run] WARN: ${NAME} 无 checkpoint, 跳过"
+        continue
+    fi
 
     ARGS="pretrained=${EVAL_PATH}"
     [[ "${NAME}" == *Qwen3* ]] && ARGS="${ARGS},enable_thinking=False"
@@ -77,6 +104,7 @@ for i in "${!MODELS[@]}"; do
 
     (( (i + 1) % BATCH_SIZE == 0 )) && wait
 done
+
 wait
 
 echo "[run] 全部完成! 结果在各模型目录下 ${EVAL_SUBDIR}/"
