@@ -10,14 +10,20 @@ LME_DIR="${ENTRY_DIR}/lm-evaluation-harness"
 
 export HF_HOME="${ENTRY_DIR}/hf_cache"
 export HF_DATASETS_CACHE="${HF_HOME}/datasets"
+export HF_DATASETS_OFFLINE=1   # 完全靠本地 cache; 先跑 scripts/download_dataset.sh 把数据备齐
 mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}"
 
-CKPT_ROOT="/mnt/hdfs/tiktok_aiic/user/lihao.612/sf_ckpts"
-CKPT_GLOB="${CKPT_GLOB:-Llama-3-8B-Instruct-vector-*-PKU_UnSafeRLHF_100}"
+# 清理上次中断遗留的 *.incomplete 目录
+find "${HF_DATASETS_CACHE}" -type d -name "*.incomplete" -exec rm -rf {} + 2>/dev/null
 
-HDFS_RUN_DIR="/mnt/hdfs/tiktok_aiic/user/lihao.612/ckpt/eval_results_general_$(date +%m%d)"
-LOG_DIR="${HDFS_RUN_DIR}/logs"
-mkdir -p "${LOG_DIR}"
+# 训练脚本把产物放到 sf_ckpts/${MODEL_BASE}/${MODEL_BASE}-vector-...
+# 切换被测 family: CKPT_BASE=Qwen3-8B bash run.sh
+CKPT_BASE="${CKPT_BASE:-Llama-3-8B-Instruct}"
+CKPT_ROOT="/mnt/hdfs/tiktok_aiic/user/lihao.612/sf_ckpts/${CKPT_BASE}"
+CKPT_GLOB="${CKPT_GLOB:-${CKPT_BASE}-vector-*-PKU_UnSafeRLHF_100}"
+
+DATE_TAG=$(date +%Y%m%d)
+EVAL_SUBDIR="eval_general_${DATE_TAG}"
 
 BATCH_SIZE=8
 TASKS="mmlu,arc_challenge,hellaswag,winogrande,truthfulqa_mc2,gsm8k"
@@ -25,20 +31,19 @@ TASKS="mmlu,arc_challenge,hellaswag,winogrande,truthfulqa_mc2,gsm8k"
 shopt -s nullglob
 MODELS=("${CKPT_ROOT}"/${CKPT_GLOB})
 shopt -u nullglob
-echo "[run] 发现 ${#MODELS[@]} 个模型, 输出 → ${HDFS_RUN_DIR}"
+echo "[run] 发现 ${#MODELS[@]} 个模型, 输出 → 各模型目录下 ${EVAL_SUBDIR}/"
 
 cd "${LME_DIR}"
 
 run_one() {
     local TEMP=$1 SUFFIX=$2 ARGS=$3 OUT_DIR=$4 GPU=$5
-    local TS=$(date +"%Y%m%d_%H%M%S")
     local DO_SAMPLE=False; [ "${TEMP}" = "1.0" ] && DO_SAMPLE=True
     CUDA_VISIBLE_DEVICES=${GPU} lm_eval --model hf \
         --model_args "${ARGS}" --tasks "${TASKS}" \
         --device cuda:0 --batch_size 32 \
         --gen_kwargs "temperature=${TEMP},do_sample=${DO_SAMPLE}" \
-        --output_path "${OUT_DIR}/results_${SUFFIX}_${TS}.json" \
-        > "${OUT_DIR}/logs/eval_${SUFFIX}_${TS}.log" 2>&1
+        --output_path "${OUT_DIR}/results_${SUFFIX}.json" \
+        > "${OUT_DIR}/logs/${SUFFIX}.log" 2>&1
 }
 
 for i in "${!MODELS[@]}"; do
@@ -59,10 +64,10 @@ for i in "${!MODELS[@]}"; do
 
     ARGS="pretrained=${EVAL_PATH}"
     [[ "${NAME}" == *Qwen3* ]] && ARGS="${ARGS},enable_thinking=False"
-    OUT_DIR="${HDFS_RUN_DIR}/${NAME}"
+    OUT_DIR="${MODEL_PATH}/${EVAL_SUBDIR}"
     mkdir -p "${OUT_DIR}/logs"
 
-    echo ">>> [GPU ${GPU_ID}] ${NAME} → $(basename ${EVAL_PATH})"
+    echo ">>> [GPU ${GPU_ID}] ${NAME} → $(basename ${EVAL_PATH})  (log: ${OUT_DIR}/logs/*.log)"
     (
         run_one 0.0 temp0      "${ARGS}" "${OUT_DIR}" "${GPU_ID}"
         run_one 1.0 temp1_run1 "${ARGS}" "${OUT_DIR}" "${GPU_ID}"
@@ -74,4 +79,4 @@ for i in "${!MODELS[@]}"; do
 done
 wait
 
-echo "[run] 全部完成! ${HDFS_RUN_DIR}"
+echo "[run] 全部完成! 结果在各模型目录下 ${EVAL_SUBDIR}/"
