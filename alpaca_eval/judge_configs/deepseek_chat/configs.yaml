@@ -1,0 +1,14 @@
+# 自定义 alpaca-eval annotator: 用 DeepSeek API (OpenAI 兼容) 做 judge
+# 复用 alpaca-eval 包内的 alpaca_eval_gpt4_0314 prompt + ranking_parser
+# 调用前需 export:
+#   OPENAI_API_KEY  = <DeepSeek key>
+#   OPENAI_API_BASE = https://api.deepseek.com
+deepseek_chat:
+  prompt_template: "/ssddata/lihao/projects/Self-Distillation-eval/lm-evaluation-harness/alpaca_eval/judge_configs/deepseek_chat/alpaca_eval.txt"
+  fn_completions: "openai_completions"
+  completions_kwargs:
+    model_name: "deepseek-chat"
+    max_tokens: 100
+    temperature: 0
+  fn_completion_parser: "ranking_parser"
+  batch_size: 1
