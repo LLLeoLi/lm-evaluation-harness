@@ -3,14 +3,11 @@
 # 用法: bash setup.sh
 # 重复执行安全: 每一步先检测, 已存在则跳过.
 #
-# 前置:
-#   - 已建好 conda env `eval_harness` (lm-evaluation-harness 主 env, 装 lm_eval CLI).
-#   - 已建好 conda env `vllm` (装了 vllm). 本脚本会再向其装 alpaca-eval.
+# 集群环境已就绪, 不需要 conda; 本脚本直接用当前 python/pip.
 #
 # ===== !!! 移植到新机器需修改 !!! =====
 # 1) ENTRY_DIR: 集群入口目录 (含 lm-evaluation-harness/, hf_cache/)
 # 2) CLUSTER_DATA_SCRIPT: 集群侧批量下数据集脚本 (没有就置空)
-# 3) ENV_NAME_EVAL / ENV_NAME_VLLM: 如两个 env 名称不同请修改
 # ======================================
 
 set -u
@@ -21,32 +18,19 @@ LME_DIR="${ENTRY_DIR}/lm-evaluation-harness"
 HF_HOME_DIR="${ENTRY_DIR}/hf_cache"
 HUB_DIR="${HF_HOME_DIR}/hub"
 CLUSTER_DATA_SCRIPT="${ENTRY_DIR}/scripts/download_dataset.sh"
-ENV_NAME_EVAL="eval_harness"
-ENV_NAME_VLLM="vllm"
 
 mkdir -p "${HF_HOME_DIR}" "${HUB_DIR}"
 
-# ===== conda 自检 + 激活 eval_harness =====
-if ! command -v conda >/dev/null 2>&1; then
-    echo "[ERROR] 未找到 conda; 请先安装 miniconda/anaconda" >&2
+# ===== python/pip 自检 (使用集群环境) =====
+if ! command -v python >/dev/null 2>&1; then
+    echo "[ERROR] 未找到 python" >&2
     exit 1
 fi
-source "$(conda info --base)/etc/profile.d/conda.sh"
-
-if ! conda env list | grep -q "^${ENV_NAME_EVAL} "; then
-    echo "[ERROR] conda env '${ENV_NAME_EVAL}' 不存在; 请先创建" >&2
+if ! command -v pip >/dev/null 2>&1; then
+    echo "[ERROR] 未找到 pip" >&2
     exit 1
 fi
-conda activate "${ENV_NAME_EVAL}"
-
-# vllm env 路径 (用 conda info 解析, 不写死)
-VLLM_ENV_DIR="$(conda info --envs | awk -v n="${ENV_NAME_VLLM}" '$1==n {print $NF}')"
-if [ -z "${VLLM_ENV_DIR}" ]; then
-    echo "[WARN] conda env '${ENV_NAME_VLLM}' 不存在; 跳过 alpaca-eval 安装"
-    vllm_pip=""
-else
-    vllm_pip="${VLLM_ENV_DIR}/bin/pip"
-fi
+PIP="pip"
 
 # ===== HF 缓存设置 (下载阶段需要联网) =====
 unset HF_DATASETS_OFFLINE HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
@@ -57,8 +41,8 @@ echo "================================================="
 echo "[setup] ENTRY_DIR  = ${ENTRY_DIR}"
 echo "[setup] LME_DIR    = ${LME_DIR}"
 echo "[setup] HF_HOME    = ${HF_HOME}"
-echo "[setup] eval env   = ${ENV_NAME_EVAL} ($(which python))"
-echo "[setup] vllm env   = ${ENV_NAME_VLLM} (${VLLM_ENV_DIR:-<missing>})"
+echo "[setup] python     = $(which python)"
+echo "[setup] pip        = $(which pip)"
 echo "================================================="
 
 # ---------- 1) 安装 lm-evaluation-harness ----------
@@ -66,9 +50,9 @@ if python -c "import lm_eval" >/dev/null 2>&1; then
     echo "[skip] lm_eval 已安装"
 else
     echo "[install] lm-evaluation-harness (editable) ..."
-    ( cd "${LME_DIR}" && pip install -e . --user ) \
+    ( cd "${LME_DIR}" && ${PIP} install -e . --user ) \
         || { echo "[ERROR] lm-evaluation-harness 安装失败"; exit 1; }
-    pip install "lm_eval[hf]" --user \
+    ${PIP} install "lm_eval[hf]" --user \
         || { echo "[ERROR] lm_eval[hf] 安装失败"; exit 1; }
 fi
 
@@ -88,20 +72,33 @@ else
 fi
 
 # ---------- 3) HF 数据集预下载 (load_dataset 触发 builder cache) ----------
+# 形如 "repo" 或 "repo:cfg1,cfg2,..."  (后者表示该 dataset 必须按 config 加载)
 DATASETS=(
     "cais/mmlu"
     "openai/gsm8k"
-    "EleutherAI/hendrycks_math"
+    "EleutherAI/hendrycks_math:algebra,counting_and_probability,geometry,intermediate_algebra,number_theory,prealgebra,precalculus"
     "openai/openai_humaneval"
 )
-for repo in "${DATASETS[@]}"; do
+for entry in "${DATASETS[@]}"; do
+    repo="${entry%%:*}"
+    cfgs="${entry#*:}"
+    [ "${cfgs}" = "${entry}" ] && cfgs=""
     builder_name="${repo//\//___}"
     if [ -d "${HF_DATASETS_CACHE}/${builder_name}" ]; then
         echo "[skip] dataset ${repo} 已有 builder cache"
-    else
+        continue
+    fi
+    if [ -z "${cfgs}" ]; then
         echo "[download] dataset ${repo} ..."
         python -c "from datasets import load_dataset; load_dataset('${repo}'); print('[ok] ${repo}')" \
             || { echo "[ERROR] 下载/build ${repo} 失败"; exit 1; }
+    else
+        IFS=',' read -r -a cfg_arr <<< "${cfgs}"
+        for cfg in "${cfg_arr[@]}"; do
+            echo "[download] dataset ${repo} (config=${cfg}) ..."
+            python -c "from datasets import load_dataset; load_dataset('${repo}', '${cfg}'); print('[ok] ${repo}/${cfg}')" \
+                || { echo "[ERROR] 下载/build ${repo}/${cfg} 失败"; exit 1; }
+        done
     fi
 done
 
@@ -116,42 +113,40 @@ else
         || { echo "[ERROR] code_eval 下载失败"; exit 1; }
 fi
 
-# ---------- 5) AlpacaEval (装到 vllm env, generate + judge 共用) ----------
-if [ -n "${vllm_pip}" ]; then
-    if "${vllm_pip}" show alpaca-eval >/dev/null 2>&1; then
-        echo "[skip] alpaca-eval 已装入 ${ENV_NAME_VLLM} env"
-    else
-        echo "[install] alpaca-eval → ${ENV_NAME_VLLM} env"
-        "${vllm_pip}" install alpaca-eval \
-            || { echo "[ERROR] alpaca-eval 安装失败"; exit 1; }
-    fi
+# ---------- 5) AlpacaEval (generate + judge 共用) ----------
+if ${PIP} show alpaca-eval >/dev/null 2>&1; then
+    echo "[skip] alpaca-eval 已安装"
+else
+    echo "[install] alpaca-eval ..."
+    ${PIP} install alpaca-eval --user \
+        || { echo "[ERROR] alpaca-eval 安装失败"; exit 1; }
+fi
 
-    for fname in alpaca_eval.json alpaca_eval_gpt4_baseline.json; do
-        fpath="${HF_HOME_DIR}/${fname}"
-        if [ -f "${fpath}" ]; then
-            echo "[skip] ${fname} 已 cache"
-        else
-            echo "[download] ${fname} ..."
-            python -c "
+for fname in alpaca_eval.json alpaca_eval_gpt4_baseline.json; do
+    fpath="${HF_HOME_DIR}/${fname}"
+    if [ -f "${fpath}" ]; then
+        echo "[skip] ${fname} 已 cache"
+    else
+        echo "[download] ${fname} ..."
+        python -c "
 from huggingface_hub import hf_hub_download
 import shutil
 p = hf_hub_download(repo_id='tatsu-lab/alpaca_eval', filename='${fname}', repo_type='dataset')
 shutil.copy(p, '${fpath}')
 print('[ok] ${fname} →', '${fpath}')
 " || { echo "[ERROR] ${fname} 下载失败"; exit 1; }
-        fi
-    done
+    fi
+done
 
-    # 修补 alpaca_eval judge config 里的绝对路径 (yaml 不支持 env 变量插值)
-    JUDGE_CFG="${LME_DIR}/alpaca_eval/judge_configs/deepseek_chat/configs.yaml"
-    PROMPT_PATH="${LME_DIR}/alpaca_eval/judge_configs/deepseek_chat/alpaca_eval.txt"
-    if [ -f "${JUDGE_CFG}" ]; then
-        if grep -qF "prompt_template: \"${PROMPT_PATH}\"" "${JUDGE_CFG}"; then
-            echo "[skip] judge config prompt_template 已正确"
-        else
-            echo "[fix] 改写 judge config prompt_template → ${PROMPT_PATH}"
-            sed -i "s|^  prompt_template: \".*\"|  prompt_template: \"${PROMPT_PATH}\"|" "${JUDGE_CFG}"
-        fi
+# 修补 alpaca_eval judge config 里的绝对路径 (yaml 不支持 env 变量插值)
+JUDGE_CFG="${LME_DIR}/alpaca_eval/judge_configs/deepseek_chat/configs.yaml"
+PROMPT_PATH="${LME_DIR}/alpaca_eval/judge_configs/deepseek_chat/alpaca_eval.txt"
+if [ -f "${JUDGE_CFG}" ]; then
+    if grep -qF "prompt_template: \"${PROMPT_PATH}\"" "${JUDGE_CFG}"; then
+        echo "[skip] judge config prompt_template 已正确"
+    else
+        echo "[fix] 改写 judge config prompt_template → ${PROMPT_PATH}"
+        sed -i "s|^  prompt_template: \".*\"|  prompt_template: \"${PROMPT_PATH}\"|" "${JUDGE_CFG}"
     fi
 fi
 

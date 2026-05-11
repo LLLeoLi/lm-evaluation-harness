@@ -6,13 +6,24 @@
 #     run_models.sh: 通过命令行参数 / MODELS 环境变量 / -f 文件 直接给定模型路径
 #                    (路径直接作为 lm_eval 的 pretrained=, 不再向下找 checkpoint-*)
 #
+#   任务集 (0507 版本, 与 _run_0507_common.sh 对齐):
+#     LM (loglikelihood, 跑 1 次):           mmlu
+#     GEN (generate_until, T=0 + T=1×N):     gsm8k, hendrycks_math, humaneval_instruct
+#
 #   用法:
 #     bash run_models.sh <model_path_or_id> [<model_path_or_id> ...]
 #     MODELS="m1 m2 m3" bash run_models.sh
 #     bash run_models.sh -f models.txt           # 从文件读, 每行一个模型
 #
+#   可选环境变量:
+#     LM_TASKS         默认 mmlu
+#     GEN_TASKS        默认 gsm8k,hendrycks_math (会自动追加 HUMANEVAL_TASK)
+#     HUMANEVAL_TASK   默认 humaneval_instruct (base 模型改用 humaneval; 设为 "" 则不跑)
+#     GEN_T1_REPEATS   GEN_TASKS 在 T=1 下重复次数, 默认 3
+#     BATCH_SIZE_LM    lm_eval --batch_size, 默认 32
+#
 #   输出:
-#     ${OUTPUT_ROOT}/<basename(model)>/${EVAL_SUBDIR}/{temp0,temp1_run1,temp1_run2,temp1_run3}/
+#     ${OUTPUT_ROOT}/<basename(model)>/${EVAL_SUBDIR}/{lm,gen_temp0,gen_temp1_run1,...}.json
 #     ${OUTPUT_ROOT}/eval_summary_${DATE_TAG}.{csv,json}
 # ==============================================================================
 set +e
@@ -20,11 +31,31 @@ set -u
 
 ENTRY_DIR="/opt/tiger/entry"
 LME_DIR="${ENTRY_DIR}/lm-evaluation-harness"
-NUM_GPUS="${NUM_GPUS:-8}"
+# 可用 GPU 数: 优先 NUM_GPUS env; 否则按 CUDA_VISIBLE_DEVICES 推断;
+# 仍未定再 fallback 到 nvidia-smi 统计的物理卡数; 都拿不到才默认 8.
+if [ -z "${NUM_GPUS:-}" ]; then
+    if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+        IFS=',' read -r -a _cvd_arr <<< "${CUDA_VISIBLE_DEVICES}"
+        NUM_GPUS=${#_cvd_arr[@]}
+    elif command -v nvidia-smi >/dev/null 2>&1; then
+        NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+        [ "${NUM_GPUS}" -eq 0 ] && NUM_GPUS=8
+    else
+        NUM_GPUS=8
+    fi
+fi
+echo "[run_models] NUM_GPUS=${NUM_GPUS} (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>})"
 
 export HF_HOME="${ENTRY_DIR}/hf_cache"
 export HF_DATASETS_CACHE="${HF_HOME}/datasets"
-export HF_DATASETS_OFFLINE=1   # 完全靠本地 cache; 先跑 scripts/download_dataset.sh 把数据备齐
+# 0507 版本: 完整离线三件套 (与 _run_0507_common.sh 对齐)
+export HF_DATASETS_OFFLINE=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+# humaneval 用 evaluate 库的 code_eval metric, import 时就要求此 env var
+# (--confirm_run_unsafe_code 是框架层, 两者都要给)
+export HF_ALLOW_CODE_EVAL=1
 mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}"
 
 # 清理上次中断遗留的 *.incomplete 目录
@@ -32,10 +63,22 @@ find "${HF_DATASETS_CACHE}" -type d -name "*.incomplete" -exec rm -rf {} + 2>/de
 
 DATE_TAG=$(date +%Y%m%d)
 EVAL_SUBDIR="eval_general_${DATE_TAG}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/hdfs/tiktok_aiic/user/lihao.612/sf_ckpts/_models_eval_general_${DATE_TAG}}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/hdfs/tiktok_aiic/user/lihao.612/sf_ckpts/_models_eval_general_0507_${DATE_TAG}}"
 
-TASKS="${TASKS:-mmlu,arc_challenge,hellaswag,winogrande,truthfulqa_mc2,gsm8k}"
+# ===== 0507 任务划分 =====
+# loglikelihood (mmlu): 当前默认跳过 (置空); 如需打开置 LM_TASKS=mmlu
+LM_TASKS="${LM_TASKS:-}"
+# generate_until: 当前默认只跑 T=0 (GEN_T1_REPEATS=0); 默认任务集去掉 gsm8k
+# humaneval: instruct 模型用 humaneval_instruct (默认), base 用 humaneval; 空字符串则不跑
+HUMANEVAL_TASK="${HUMANEVAL_TASK-humaneval_instruct}"
+GEN_TASKS="${GEN_TASKS:-hendrycks_math}"
+[[ -n "${HUMANEVAL_TASK}" ]] && GEN_TASKS="${GEN_TASKS},${HUMANEVAL_TASK}"
+GEN_T1_REPEATS="${GEN_T1_REPEATS:-0}"
 BATCH_SIZE_LM="${BATCH_SIZE_LM:-32}"
+
+# humaneval (任一变体) 需要 --confirm_run_unsafe_code
+GEN_EXTRA_ARGS=()
+[[ "${GEN_TASKS}" == *humaneval* ]] && GEN_EXTRA_ARGS+=( --confirm_run_unsafe_code )
 
 # ------------- 解析模型列表 -------------
 MODELS_INPUT=()
@@ -67,13 +110,30 @@ for m in "${MODELS_INPUT[@]}"; do echo "  - $m"; done
 
 cd "${LME_DIR}"
 
-run_one() {
-    local TEMP=$1 SUFFIX=$2 ARGS=$3 OUT_DIR=$4 GPU=$5
-    local DO_SAMPLE=False; [ "${TEMP}" = "1.0" ] && DO_SAMPLE=True
+# loglikelihood 任务集 (mmlu), 不传 gen_kwargs
+run_lm() {
+    local ARGS=$1 OUT_DIR=$2 GPU=$3
     CUDA_VISIBLE_DEVICES=${GPU} lm_eval --model hf \
-        --model_args "${ARGS}" --tasks "${TASKS}" \
+        --model_args "${ARGS}" --tasks "${LM_TASKS}" \
         --device cuda:0 --batch_size "${BATCH_SIZE_LM}" \
-        --gen_kwargs "temperature=${TEMP},do_sample=${DO_SAMPLE}" \
+        --output_path "${OUT_DIR}/results_lm.json" \
+        > "${OUT_DIR}/logs/lm.log" 2>&1
+}
+
+# generate_until 任务集 (gsm8k, hendrycks_math, humaneval_instruct), 单一温度配置
+run_gen() {
+    local TEMP=$1 SUFFIX=$2 ARGS=$3 OUT_DIR=$4 GPU=$5
+    local GEN_KWARGS
+    if [ "${TEMP}" = "0.0" ]; then
+        GEN_KWARGS="do_sample=False"
+    else
+        GEN_KWARGS="temperature=${TEMP},do_sample=True"
+    fi
+    CUDA_VISIBLE_DEVICES=${GPU} lm_eval --model hf \
+        --model_args "${ARGS}" --tasks "${GEN_TASKS}" \
+        --device cuda:0 --batch_size "${BATCH_SIZE_LM}" \
+        --gen_kwargs "${GEN_KWARGS}" \
+        "${GEN_EXTRA_ARGS[@]}" \
         --output_path "${OUT_DIR}/results_${SUFFIX}.json" \
         > "${OUT_DIR}/logs/${SUFFIX}.log" 2>&1
 }
@@ -146,10 +206,11 @@ for MODEL_PATH in "${MODELS_INPUT[@]}"; do
     GPU_ID=$ACQUIRED_GPU
     echo ">>> [GPU ${GPU_ID}] ${NAME} → ${MODEL_PATH}  (log: ${OUT_BASE}/logs/*.log)"
     (
-        run_one 0.0 temp0      "${ARGS}" "${OUT_BASE}" "${GPU_ID}"
-        run_one 1.0 temp1_run1 "${ARGS}" "${OUT_BASE}" "${GPU_ID}"
-        run_one 1.0 temp1_run2 "${ARGS}" "${OUT_BASE}" "${GPU_ID}"
-        run_one 1.0 temp1_run3 "${ARGS}" "${OUT_BASE}" "${GPU_ID}"
+        [[ -n "${LM_TASKS}" ]] && run_lm "${ARGS}" "${OUT_BASE}" "${GPU_ID}"
+        [[ -n "${GEN_TASKS}" ]] && run_gen 0.0 gen_temp0 "${ARGS}" "${OUT_BASE}" "${GPU_ID}"
+        for ((j=1; j<=GEN_T1_REPEATS; j++)); do
+            run_gen 1.0 "gen_temp1_run${j}" "${ARGS}" "${OUT_BASE}" "${GPU_ID}"
+        done
     ) &
     GPU_PID[${GPU_ID}]=$!
     sleep "${LAUNCH_STAGGER}"
