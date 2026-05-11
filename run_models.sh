@@ -103,6 +103,7 @@ LAUNCH_STAGGER="${LAUNCH_STAGGER:-5}"  # 启动间隔, 错开 ckpt shard 加载�
 EVAL_BASES=()
 EVAL_NAMES=()
 
+declare -A SEEN_NAMES
 for MODEL_PATH in "${MODELS_INPUT[@]}"; do
     # 去掉末尾 / 后取 basename, 作为输出目录名
     _MP="${MODEL_PATH%/}"
@@ -112,6 +113,21 @@ for MODEL_PATH in "${MODELS_INPUT[@]}"; do
         PARENT=$(basename "$(dirname "${_MP}")")
         NAME="${PARENT}-${NAME}"
     fi
+    # 通用去重: 若该 NAME 已被占用 (不同 MODEL_PATH 同 basename, 例如多个 .../<algo>/ppo-lag),
+    # 不断向上拼父目录, 直到唯一; 路径根都用尽则附加序号
+    if [ -n "${SEEN_NAMES[${NAME}]:-}" ] && [ "${SEEN_NAMES[${NAME}]}" != "${MODEL_PATH}" ]; then
+        _D="$(dirname "${_MP}")"
+        while [ -n "${SEEN_NAMES[${NAME}]:-}" ] && [ "${SEEN_NAMES[${NAME}]}" != "${MODEL_PATH}" ] && [ "${_D}" != "/" ] && [ "${_D}" != "." ]; do
+            NAME="$(basename "${_D}")-${NAME}"
+            _D="$(dirname "${_D}")"
+        done
+        _i=2
+        while [ -n "${SEEN_NAMES[${NAME}]:-}" ] && [ "${SEEN_NAMES[${NAME}]}" != "${MODEL_PATH}" ]; do
+            NAME="${NAME}_${_i}"
+            _i=$((_i+1))
+        done
+    fi
+    SEEN_NAMES[${NAME}]="${MODEL_PATH}"
 
     if [ ! -e "${MODEL_PATH}" ]; then
         # 不存在的本地路径仍允许 (可能是 HF id), 仅打印提示
