@@ -138,6 +138,21 @@ print('[ok] ${fname} →', '${fpath}')
     fi
 done
 
+# length-controlled winrate 计算时 alpaca_eval/metrics/glm_winrate.py 会
+# hf_hub_download 这个校准文件; 离线模式下会炸, 这里提前预热进 HF cache.
+df_gamed_marker="${HF_HOME_DIR}/.df_gamed_cached"
+if [ -f "${df_gamed_marker}" ]; then
+    echo "[skip] df_gamed.csv 已 cache"
+else
+    echo "[download] df_gamed.csv (alpaca_eval length-controlled winrate 校准文件) ..."
+    python -c "
+from huggingface_hub import hf_hub_download
+p = hf_hub_download(repo_id='tatsu-lab/alpaca_eval', filename='df_gamed.csv', repo_type='dataset')
+print('[ok] df_gamed.csv →', p)
+" && touch "${df_gamed_marker}" \
+    || { echo "[ERROR] df_gamed.csv 下载失败"; exit 1; }
+fi
+
 # 修补 alpaca_eval judge config 里的绝对路径 (yaml 不支持 env 变量插值)
 JUDGE_CFG="${LME_DIR}/alpaca_eval/judge_configs/deepseek_chat/configs.yaml"
 PROMPT_PATH="${LME_DIR}/alpaca_eval/judge_configs/deepseek_chat/alpaca_eval.txt"
