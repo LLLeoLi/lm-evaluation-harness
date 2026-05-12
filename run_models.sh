@@ -168,6 +168,17 @@ LAUNCH_STAGGER="${LAUNCH_STAGGER:-5}"  # 启动间隔, 错开 ckpt shard 加载�
 EVAL_BASES=()
 EVAL_NAMES=()
 
+# ---- 预扫: 计算每个初始 basename 的出现次数, 这样首次出现的同名条目也能拿到前缀 ----
+declare -A BASE_COUNT
+for _MP_RAW in "${MODELS_INPUT[@]}"; do
+    _MP_TMP="${_MP_RAW%/}"
+    _BN=$(basename "${_MP_TMP}")
+    if [[ "${_BN}" == checkpoint-* ]]; then
+        _BN="$(basename "$(dirname "${_MP_TMP}")")-${_BN}"
+    fi
+    BASE_COUNT[${_BN}]=$(( ${BASE_COUNT[${_BN}]:-0} + 1 ))
+done
+
 declare -A SEEN_NAMES
 for MODEL_PATH in "${MODELS_INPUT[@]}"; do
     # 去掉末尾 / 后取 basename, 作为输出目录名
@@ -178,14 +189,21 @@ for MODEL_PATH in "${MODELS_INPUT[@]}"; do
         PARENT=$(basename "$(dirname "${_MP}")")
         NAME="${PARENT}-${NAME}"
     fi
-    # 通用去重: 若该 NAME 已被占用 (不同 MODEL_PATH 同 basename, 例如多个 .../<algo>/ppo-lag),
-    # 不断向上拼父目录, 直到唯一; 路径根都用尽则附加序号
+    # 若初始 NAME 在整组 MODELS_INPUT 中出现 >1 次, 立即向上拼一层父目录,
+    # 让所有同名条目都从带前缀开始 (例: 4 个 .../<arch>/mocan 应全部带 arch 前缀);
+    # 后续若仍冲突, 再继续向上拼直到唯一
+    _D="$(dirname "${_MP}")"
+    if [ "${BASE_COUNT[${NAME}]:-0}" -gt 1 ] && [ "${_D}" != "/" ] && [ "${_D}" != "." ]; then
+        NAME="$(basename "${_D}")-${NAME}"
+        _D="$(dirname "${_D}")"
+    fi
+    # 通用去重: 若 NAME 仍与已分配的不同 MODEL_PATH 冲突, 继续向上拼父目录直到唯一
+    while [ -n "${SEEN_NAMES[${NAME}]:-}" ] && [ "${SEEN_NAMES[${NAME}]}" != "${MODEL_PATH}" ] && [ "${_D}" != "/" ] && [ "${_D}" != "." ]; do
+        NAME="$(basename "${_D}")-${NAME}"
+        _D="$(dirname "${_D}")"
+    done
+    # 兜底: 拼到根仍冲突 (理论上极少), 附加序号
     if [ -n "${SEEN_NAMES[${NAME}]:-}" ] && [ "${SEEN_NAMES[${NAME}]}" != "${MODEL_PATH}" ]; then
-        _D="$(dirname "${_MP}")"
-        while [ -n "${SEEN_NAMES[${NAME}]:-}" ] && [ "${SEEN_NAMES[${NAME}]}" != "${MODEL_PATH}" ] && [ "${_D}" != "/" ] && [ "${_D}" != "." ]; do
-            NAME="$(basename "${_D}")-${NAME}"
-            _D="$(dirname "${_D}")"
-        done
         _i=2
         while [ -n "${SEEN_NAMES[${NAME}]:-}" ] && [ "${SEEN_NAMES[${NAME}]}" != "${MODEL_PATH}" ]; do
             NAME="${NAME}_${_i}"
@@ -312,6 +330,10 @@ if [ "${RUN_ALPACA:-1}" = "1" ]; then
                 fi
                 mkdir -p "${JUDGE_OUT}"
                 echo "-> alpaca-judge ${NAME}"
+                # alpaca_eval 的 length-controlled winrate 需要从 HF 下载
+                # tatsu-lab/alpaca_eval/df_gamed.csv, 这里临时取消 HF 离线模式;
+                # 文件首次下载后会缓存到 HF_HOME, 后续仍能离线复用.
+                HF_HUB_OFFLINE=0 HF_DATASETS_OFFLINE=0 TRANSFORMERS_OFFLINE=0 \
                 "${ALPACA_EVAL_BIN}" \
                     --model_outputs "${OUT_JSON}" \
                     --reference_outputs "${REFERENCE_JSON}" \
@@ -341,6 +363,9 @@ csv_path, json_path, eval_subdir, alpaca_subdir, *model_paths = sys.argv[1:]
 PREFERRED = [
     "acc,none", "acc_norm,none",
     "exact_match,strict-match", "exact_match,flexible-extract",
+    "exact_match,none",            # hendrycks_math 顶层 / 子任务
+    "pass@1,create_test",          # humaneval / humaneval_instruct
+    "pass@1,none",
     "mc2,none", "em,none",
 ]
 
