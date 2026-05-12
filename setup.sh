@@ -138,6 +138,20 @@ print('[ok] ${fname} →', '${fpath}')
     fi
 done
 
+# Alpaca-7B 参考输出 (win-rate vs Alpaca-7B 的 baseline). tatsu-lab/alpaca_eval HF
+# dataset 里没有这份文件, 直接从 GitHub raw 拉.
+alpaca_7b_path="${HF_HOME_DIR}/alpaca_7b_baseline.json"
+if [ -f "${alpaca_7b_path}" ]; then
+    echo "[skip] alpaca_7b_baseline.json 已 cache"
+else
+    echo "[download] alpaca_7b_baseline.json (Alpaca-7B reference outputs) ..."
+    curl -fsSL \
+        "https://raw.githubusercontent.com/tatsu-lab/alpaca_eval/main/results/alpaca-7b/model_outputs.json" \
+        -o "${alpaca_7b_path}" \
+        || { echo "[ERROR] alpaca_7b_baseline.json 下载失败"; exit 1; }
+    echo "[ok] alpaca_7b_baseline.json → ${alpaca_7b_path}"
+fi
+
 # length-controlled winrate 计算时 alpaca_eval/metrics/glm_winrate.py 会
 # hf_hub_download 这个校准文件; 离线模式下会炸, 这里提前预热进 HF cache.
 df_gamed_marker="${HF_HOME_DIR}/.df_gamed_cached"
