@@ -21,6 +21,11 @@
 #     HUMANEVAL_TASK   默认 humaneval_instruct (base 模型改用 humaneval; 设为 "" 则不跑)
 #     GEN_T1_REPEATS   GEN_TASKS 在 T=1 下重复次数, 默认 3
 #     BATCH_SIZE_LM    lm_eval --batch_size, 默认 32
+#     RUN_ALPACA       =1 时追加 AlpacaEval 评测 (默认 1, 设 0 跳过)
+#     ALPACA_SKIP_JUDGE =1 时只生成 model_outputs.json, 不调 DeepSeek API judge
+#     VLLM_PY          AlpacaEval 生成阶段用的 python (默认 python; 需含 vllm)
+#     ALPACA_EVAL_BIN  alpaca_eval CLI 路径 (默认 alpaca_eval)
+#     GEN_TEMP/GEN_TOP_P/GEN_MAX_TOKENS  生成采样参数 (默认 0.7 / 1.0 / 512)
 #
 #   输出:
 #     ${OUTPUT_ROOT}/<basename(model)>/${EVAL_SUBDIR}/{lm,gen_temp0,gen_temp1_run1,...}.json
@@ -66,12 +71,12 @@ EVAL_SUBDIR="eval_general_${DATE_TAG}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/hdfs/tiktok_aiic/user/lihao.612/sf_ckpts/_models_eval_general_0507_${DATE_TAG}}"
 
 # ===== 0507 任务划分 =====
-# loglikelihood (mmlu): 当前默认跳过 (置空); 如需打开置 LM_TASKS=mmlu
-LM_TASKS="${LM_TASKS:-}"
-# generate_until: 当前默认只跑 T=0 (GEN_T1_REPEATS=0); 默认任务集去掉 gsm8k
+# loglikelihood (mmlu): 默认开启
+LM_TASKS="${LM_TASKS:-mmlu}"
+# generate_until: 当前默认只跑 T=0 (GEN_T1_REPEATS=0); 默认任务集包含 gsm8k + hendrycks_math
 # humaneval: instruct 模型用 humaneval_instruct (默认), base 用 humaneval; 空字符串则不跑
 HUMANEVAL_TASK="${HUMANEVAL_TASK-humaneval_instruct}"
-GEN_TASKS="${GEN_TASKS:-hendrycks_math}"
+GEN_TASKS="${GEN_TASKS:-gsm8k,hendrycks_math}"
 [[ -n "${HUMANEVAL_TASK}" ]] && GEN_TASKS="${GEN_TASKS},${HUMANEVAL_TASK}"
 GEN_T1_REPEATS="${GEN_T1_REPEATS:-0}"
 BATCH_SIZE_LM="${BATCH_SIZE_LM:-32}"
@@ -219,22 +224,120 @@ done
 wait
 echo "[run_models] 推理阶段完成"
 
-# ============ 汇总: 把所有模型每个 task 的主指标拢到一张表 ============
+ALPACA_SUBDIR="alpaca_${DATE_TAG}"
+
+# ============ 可选阶段: AlpacaEval (vLLM 生成 + DeepSeek judge) ============
+if [ "${RUN_ALPACA:-1}" = "1" ]; then
+    ALPACA_JSON="${ALPACA_JSON:-${HF_HOME}/alpaca_eval.json}"
+    REFERENCE_JSON="${REFERENCE_JSON:-${HF_HOME}/alpaca_eval_gpt4_baseline.json}"
+    JUDGE_CONFIG_DIR="${JUDGE_CONFIG_DIR:-${LME_DIR}/alpaca_eval/judge_configs/deepseek_chat}"
+    GEN_SCRIPT="${LME_DIR}/alpaca_eval/generate_alpaca_0507.py"
+    VLLM_PY="${VLLM_PY:-python}"
+    ALPACA_EVAL_BIN="${ALPACA_EVAL_BIN:-alpaca_eval}"
+    GEN_TEMP="${GEN_TEMP:-0.7}"
+    GEN_TOP_P="${GEN_TOP_P:-1.0}"
+    GEN_MAX_TOKENS="${GEN_MAX_TOKENS:-512}"
+    ALPACA_LIMIT="${ALPACA_LIMIT:-}"
+    ALPACA_LIMIT_ARGS=()
+    [[ -n "${ALPACA_LIMIT}" ]] && ALPACA_LIMIT_ARGS=( --limit "${ALPACA_LIMIT}" )
+
+    if [ ! -f "${ALPACA_JSON}" ]; then
+        echo "[alpaca] ERROR: ${ALPACA_JSON} 不存在; 请先跑 setup.sh"
+    elif [ ! -x "${GEN_SCRIPT}" ] && [ ! -f "${GEN_SCRIPT}" ]; then
+        echo "[alpaca] ERROR: 找不到生成脚本 ${GEN_SCRIPT}"
+    else
+        # judge 需要 DeepSeek API
+        export OPENAI_API_BASE="${OPENAI_API_BASE:-https://api.deepseek.com}"
+        export OPENAI_API_KEY="sk-df40a12b34f948619dddccaaa4c01ca6"
+        DO_JUDGE=1
+        if [ "${ALPACA_SKIP_JUDGE:-0}" = "1" ]; then
+            DO_JUDGE=0
+            echo "[alpaca] ALPACA_SKIP_JUDGE=1, 只生成不 judge"
+        elif [ -z "${OPENAI_API_KEY:-}" ]; then
+            DO_JUDGE=0
+            echo "[alpaca] WARN: 未设置 OPENAI_API_KEY, 跳过 judge 阶段"
+        fi
+
+        echo ""
+        echo ">>> AlpacaEval Phase 1: vLLM generate (${#EVAL_NAMES[@]} 模型 / ${NUM_GPUS} 卡)"
+        # 复用 GPU 调度: 一卡一模型
+        for g in "${!GPU_PID[@]}"; do GPU_PID[$g]=0; done
+        for idx in "${!EVAL_NAMES[@]}"; do
+            NAME="${EVAL_NAMES[$idx]}"
+            MODEL_PATH="${MODELS_INPUT[$idx]}"
+            OUT_DIR="${OUTPUT_ROOT}/${NAME}/alpaca_${DATE_TAG}"
+            OUT_JSON="${OUT_DIR}/model_outputs.json"
+            mkdir -p "${OUT_DIR}/logs"
+            if [ -f "${OUT_JSON}" ]; then
+                echo "[alpaca-skip-gen] ${NAME} (model_outputs.json 已存在)"
+                continue
+            fi
+            acquire_gpu
+            GPU_ID=$ACQUIRED_GPU
+            echo ">>> [GPU ${GPU_ID}] alpaca-gen ${NAME}"
+            (
+                "${VLLM_PY}" "${GEN_SCRIPT}" \
+                    --model_path "${MODEL_PATH}" \
+                    --output_path "${OUT_JSON}" \
+                    --model_name "${NAME}" \
+                    --alpaca_json "${ALPACA_JSON}" \
+                    --device_ids "${GPU_ID}" \
+                    --temperature "${GEN_TEMP}" \
+                    --top_p "${GEN_TOP_P}" \
+                    --max_tokens "${GEN_MAX_TOKENS}" \
+                    "${ALPACA_LIMIT_ARGS[@]}" \
+                    > "${OUT_DIR}/logs/gen.log" 2>&1
+            ) &
+            GPU_PID[${GPU_ID}]=$!
+            sleep "${LAUNCH_STAGGER}"
+        done
+        wait
+        echo "[alpaca] 生成阶段完成"
+
+        if [ "${DO_JUDGE}" = "1" ]; then
+            echo ""
+            echo ">>> AlpacaEval Phase 2: alpaca_eval judge (顺序, DeepSeek API)"
+            for idx in "${!EVAL_NAMES[@]}"; do
+                NAME="${EVAL_NAMES[$idx]}"
+                OUT_DIR="${OUTPUT_ROOT}/${NAME}/alpaca_${DATE_TAG}"
+                OUT_JSON="${OUT_DIR}/model_outputs.json"
+                JUDGE_OUT="${OUT_DIR}/judge"
+                if [ ! -f "${OUT_JSON}" ]; then
+                    echo "[alpaca-skip-judge] ${NAME} (没有 model_outputs.json)"
+                    continue
+                fi
+                if [ -f "${JUDGE_OUT}/leaderboard.csv" ]; then
+                    echo "[alpaca-skip-judge] ${NAME} (leaderboard.csv 已存在)"
+                    continue
+                fi
+                mkdir -p "${JUDGE_OUT}"
+                echo "-> alpaca-judge ${NAME}"
+                "${ALPACA_EVAL_BIN}" \
+                    --model_outputs "${OUT_JSON}" \
+                    --reference_outputs "${REFERENCE_JSON}" \
+                    --annotators_config "${JUDGE_CONFIG_DIR}" \
+                    --output_path "${JUDGE_OUT}" \
+                    > "${OUT_DIR}/logs/judge.log" 2>&1
+            done
+            echo "[alpaca] judge 阶段完成"
+        fi
+    fi
+fi
+
+# ============ 汇总: lm-eval (json) + AlpacaEval (leaderboard.csv) ============
 SUMMARY_CSV="${OUTPUT_ROOT}/eval_summary_${DATE_TAG}.csv"
 SUMMARY_JSON="${OUTPUT_ROOT}/eval_summary_${DATE_TAG}.json"
 
-# 把每个模型的 "<OUTPUT_ROOT>/<NAME>" 父目录传给 python, 复用 run.sh 的汇总逻辑
 PARENTS=()
 for OUT_BASE in "${EVAL_BASES[@]}"; do
     PARENTS+=("$(dirname "${OUT_BASE}")")
 done
 
-python - "${SUMMARY_CSV}" "${SUMMARY_JSON}" "${EVAL_SUBDIR}" "${PARENTS[@]}" <<'PY'
+python - "${SUMMARY_CSV}" "${SUMMARY_JSON}" "${EVAL_SUBDIR}" "${ALPACA_SUBDIR}" "${PARENTS[@]}" <<'PY'
 import csv, json, os, sys
 
-csv_path, json_path, eval_subdir, *model_paths = sys.argv[1:]
+csv_path, json_path, eval_subdir, alpaca_subdir, *model_paths = sys.argv[1:]
 
-# 选主指标的优先级 (lm-eval 不同 task 字段名不一样)
 PREFERRED = [
     "acc,none", "acc_norm,none",
     "exact_match,strict-match", "exact_match,flexible-extract",
@@ -256,46 +359,87 @@ def pick_primary(metrics):
 rows = []
 for mp in model_paths:
     name = os.path.basename(mp.rstrip("/"))
+
+    # --- lm-eval results ---
     eval_dir = os.path.join(mp, eval_subdir)
-    if not os.path.isdir(eval_dir):
-        continue
-    for root, _, files in os.walk(eval_dir):
-        if os.path.basename(root) == "logs":
-            continue
-        for fn in files:
-            if not fn.endswith(".json") or "samples" in fn:
+    if os.path.isdir(eval_dir):
+        for root, _, files in os.walk(eval_dir):
+            if os.path.basename(root) == "logs":
                 continue
-            fp = os.path.join(root, fn)
-            try:
-                with open(fp, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception as e:
-                print(f"[summary] WARN: 读取失败 {fp}: {e}")
-                continue
-            if not isinstance(data, dict):
-                continue
-            results = data.get("results")
-            if not isinstance(results, dict):
-                continue
-            rel = os.path.relpath(fp, eval_dir)
-            top = rel.split(os.sep)[0]
-            if top.endswith(".json"):
-                split = top[:-5].removeprefix("results_")
-            else:
-                split = top.removeprefix("results_")
-            for task, metrics in results.items():
-                if not isinstance(metrics, dict):
+            for fn in files:
+                if not fn.endswith(".json") or "samples" in fn:
                     continue
-                metric_key, value = pick_primary(metrics)
-                if value is None:
+                fp = os.path.join(root, fn)
+                try:
+                    with open(fp, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception as e:
+                    print(f"[summary] WARN: 读取失败 {fp}: {e}")
                     continue
-                rows.append({
-                    "model": name,
-                    "split": split,
-                    "task": task,
-                    "metric": metric_key,
-                    "value": float(value),
-                })
+                if not isinstance(data, dict):
+                    continue
+                results = data.get("results")
+                if not isinstance(results, dict):
+                    continue
+                rel = os.path.relpath(fp, eval_dir)
+                top = rel.split(os.sep)[0]
+                if top.endswith(".json"):
+                    split = top[:-5].removeprefix("results_")
+                else:
+                    split = top.removeprefix("results_")
+                for task, metrics in results.items():
+                    if not isinstance(metrics, dict):
+                        continue
+                    metric_key, value = pick_primary(metrics)
+                    if value is None:
+                        continue
+                    rows.append({
+                        "model": name,
+                        "split": split,
+                        "task": task,
+                        "metric": metric_key,
+                        "value": float(value),
+                    })
+
+    # --- AlpacaEval leaderboard.csv ---
+    leaderboard = os.path.join(mp, alpaca_subdir, "judge", "leaderboard.csv")
+    if os.path.isfile(leaderboard):
+        try:
+            with open(leaderboard, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                lb_rows = list(reader)
+        except Exception as e:
+            print(f"[summary] WARN: 读取失败 {leaderboard}: {e}")
+            lb_rows = []
+        # 只取本模型那一行 (排除 baseline)
+        target = None
+        for r in lb_rows:
+            mid = r.get("") or r.get("model") or r.get("Unnamed: 0") or ""
+            if mid == name:
+                target = r
+                break
+        if target is None and lb_rows:
+            # fallback: 第一行非 baseline
+            for r in lb_rows:
+                mid = r.get("") or r.get("model") or r.get("Unnamed: 0") or ""
+                if "baseline" not in mid.lower() and "gpt4" not in mid.lower():
+                    target = r
+                    break
+        if target is not None:
+            for metric_key in ("length_controlled_winrate", "win_rate", "standard_error"):
+                v = target.get(metric_key)
+                if v in (None, ""):
+                    continue
+                try:
+                    rows.append({
+                        "model": name,
+                        "split": "alpaca_eval",
+                        "task": "alpaca_eval",
+                        "metric": metric_key,
+                        "value": float(v),
+                    })
+                except ValueError:
+                    pass
 
 rows.sort(key=lambda r: (r["model"], r["split"], r["task"]))
 
@@ -316,4 +460,4 @@ print(f"\n[summary] CSV  → {csv_path}")
 print(f"[summary] JSON → {json_path}")
 PY
 
-echo "[run_models] 全部完成! 结果在 ${OUTPUT_ROOT}/<model>/${EVAL_SUBDIR}/"
+echo "[run_models] 全部完成! 结果在 ${OUTPUT_ROOT}/<model>/{${EVAL_SUBDIR},${ALPACA_SUBDIR}}/"
