@@ -6,6 +6,11 @@
 #     run_models.sh: 通过命令行参数 / MODELS 环境变量 / -f 文件 直接给定模型路径
 #                    (路径直接作为 lm_eval 的 pretrained=, 不再向下找 checkpoint-*)
 #
+#   执行顺序 (本版本):
+#     1) AlpacaEval (vLLM generate + DeepSeek judge)      —— 先跑
+#     2) lm-eval-harness (mmlu / gsm8k / math / humaneval) —— 后跑
+#     3) 汇总 CSV/JSON
+#
 #   任务集 (0507 版本, 与 _run_0507_common.sh 对齐):
 #     LM (loglikelihood, 跑 1 次):           mmlu
 #     GEN (generate_until, T=0 + T=1×N):     gsm8k, hendrycks_math, humaneval_instruct
@@ -29,6 +34,7 @@
 #
 #   输出:
 #     ${OUTPUT_ROOT}/<basename(model)>/${EVAL_SUBDIR}/{lm,gen_temp0,gen_temp1_run1,...}.json
+#     ${OUTPUT_ROOT}/<basename(model)>/${ALPACA_SUBDIR}/{model_outputs.json,judge/}
 #     ${OUTPUT_ROOT}/eval_summary_${DATE_TAG}.{csv,json}
 # ==============================================================================
 set +e
@@ -68,6 +74,7 @@ find "${HF_DATASETS_CACHE}" -type d -name "*.incomplete" -exec rm -rf {} + 2>/de
 
 DATE_TAG=$(date +%Y%m%d)
 EVAL_SUBDIR="eval_general_${DATE_TAG}"
+ALPACA_SUBDIR="alpaca_${DATE_TAG}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/hdfs/tiktok_aiic/user/lihao.612/sf_ckpts/_models_eval_general_0507_${DATE_TAG}}"
 
 # ===== 0507 任务划分 =====
@@ -136,6 +143,7 @@ run_gen() {
     fi
     CUDA_VISIBLE_DEVICES=${GPU} lm_eval --model hf \
         --model_args "${ARGS}" --tasks "${GEN_TASKS}" \
+        --apply_chat_template --fewshot_as_multiturn \
         --device cuda:0 --batch_size "${BATCH_SIZE_LM}" \
         --gen_kwargs "${GEN_KWARGS}" \
         "${GEN_EXTRA_ARGS[@]}" \
@@ -164,21 +172,11 @@ acquire_gpu() {
 
 LAUNCH_STAGGER="${LAUNCH_STAGGER:-5}"  # 启动间隔, 错开 ckpt shard 加载峰值
 
-# 记录 (model_path, out_base) 对供阶段 2 汇总复用
+# ============================================================================
+# 阶段 0: 预先解析每个模型的 NAME / OUT_BASE (两个阶段共享, 避免重复)
+# ============================================================================
 EVAL_BASES=()
 EVAL_NAMES=()
-
-# ---- 预扫: 计算每个初始 basename 的出现次数, 这样首次出现的同名条目也能拿到前缀 ----
-declare -A BASE_COUNT
-for _MP_RAW in "${MODELS_INPUT[@]}"; do
-    _MP_TMP="${_MP_RAW%/}"
-    _BN=$(basename "${_MP_TMP}")
-    if [[ "${_BN}" == checkpoint-* ]]; then
-        _BN="$(basename "$(dirname "${_MP_TMP}")")-${_BN}"
-    fi
-    BASE_COUNT[${_BN}]=$(( ${BASE_COUNT[${_BN}]:-0} + 1 ))
-done
-
 declare -A SEEN_NAMES
 for MODEL_PATH in "${MODELS_INPUT[@]}"; do
     # 去掉末尾 / 后取 basename, 作为输出目录名
@@ -189,21 +187,14 @@ for MODEL_PATH in "${MODELS_INPUT[@]}"; do
         PARENT=$(basename "$(dirname "${_MP}")")
         NAME="${PARENT}-${NAME}"
     fi
-    # 若初始 NAME 在整组 MODELS_INPUT 中出现 >1 次, 立即向上拼一层父目录,
-    # 让所有同名条目都从带前缀开始 (例: 4 个 .../<arch>/mocan 应全部带 arch 前缀);
-    # 后续若仍冲突, 再继续向上拼直到唯一
-    _D="$(dirname "${_MP}")"
-    if [ "${BASE_COUNT[${NAME}]:-0}" -gt 1 ] && [ "${_D}" != "/" ] && [ "${_D}" != "." ]; then
-        NAME="$(basename "${_D}")-${NAME}"
-        _D="$(dirname "${_D}")"
-    fi
-    # 通用去重: 若 NAME 仍与已分配的不同 MODEL_PATH 冲突, 继续向上拼父目录直到唯一
-    while [ -n "${SEEN_NAMES[${NAME}]:-}" ] && [ "${SEEN_NAMES[${NAME}]}" != "${MODEL_PATH}" ] && [ "${_D}" != "/" ] && [ "${_D}" != "." ]; do
-        NAME="$(basename "${_D}")-${NAME}"
-        _D="$(dirname "${_D}")"
-    done
-    # 兜底: 拼到根仍冲突 (理论上极少), 附加序号
+    # 通用去重: 若该 NAME 已被占用 (不同 MODEL_PATH 同 basename, 例如多个 .../<algo>/ppo-lag),
+    # 不断向上拼父目录, 直到唯一; 路径根都用尽则附加序号
     if [ -n "${SEEN_NAMES[${NAME}]:-}" ] && [ "${SEEN_NAMES[${NAME}]}" != "${MODEL_PATH}" ]; then
+        _D="$(dirname "${_MP}")"
+        while [ -n "${SEEN_NAMES[${NAME}]:-}" ] && [ "${SEEN_NAMES[${NAME}]}" != "${MODEL_PATH}" ] && [ "${_D}" != "/" ] && [ "${_D}" != "." ]; do
+            NAME="$(basename "${_D}")-${NAME}"
+            _D="$(dirname "${_D}")"
+        done
         _i=2
         while [ -n "${SEEN_NAMES[${NAME}]:-}" ] && [ "${SEEN_NAMES[${NAME}]}" != "${MODEL_PATH}" ]; do
             NAME="${NAME}_${_i}"
@@ -217,37 +208,17 @@ for MODEL_PATH in "${MODELS_INPUT[@]}"; do
         echo "[run_models] NOTE: ${MODEL_PATH} 不是本地路径, 当作 HF model id 处理"
     fi
 
-    ARGS="pretrained=${MODEL_PATH}"
-    [[ "${NAME}" == *Qwen3* ]] && ARGS="${ARGS},enable_thinking=False"
-
     OUT_BASE="${OUTPUT_ROOT}/${NAME}/${EVAL_SUBDIR}"
-    mkdir -p "${OUT_BASE}/logs"
     EVAL_BASES+=("${OUT_BASE}")
     EVAL_NAMES+=("${NAME}")
-
-    acquire_gpu
-    GPU_ID=$ACQUIRED_GPU
-    echo ">>> [GPU ${GPU_ID}] ${NAME} → ${MODEL_PATH}  (log: ${OUT_BASE}/logs/*.log)"
-    (
-        [[ -n "${LM_TASKS}" ]] && run_lm "${ARGS}" "${OUT_BASE}" "${GPU_ID}"
-        [[ -n "${GEN_TASKS}" ]] && run_gen 0.0 gen_temp0 "${ARGS}" "${OUT_BASE}" "${GPU_ID}"
-        for ((j=1; j<=GEN_T1_REPEATS; j++)); do
-            run_gen 1.0 "gen_temp1_run${j}" "${ARGS}" "${OUT_BASE}" "${GPU_ID}"
-        done
-    ) &
-    GPU_PID[${GPU_ID}]=$!
-    sleep "${LAUNCH_STAGGER}"
 done
 
-wait
-echo "[run_models] 推理阶段完成"
-
-ALPACA_SUBDIR="alpaca_${DATE_TAG}"
-
-# ============ 可选阶段: AlpacaEval (vLLM 生成 + DeepSeek judge) ============
+# ============================================================================
+# 阶段 1: AlpacaEval (vLLM 生成 + DeepSeek judge)  —— 先跑
+# ============================================================================
 if [ "${RUN_ALPACA:-1}" = "1" ]; then
     ALPACA_JSON="${ALPACA_JSON:-${HF_HOME}/alpaca_eval.json}"
-    REFERENCE_JSON="${REFERENCE_JSON:-${HF_HOME}/alpaca_eval_gpt4_baseline.json}"
+    REFERENCE_JSON="${REFERENCE_JSON:-${HF_HOME}/alpaca_7b_baseline.json}"
     JUDGE_CONFIG_DIR="${JUDGE_CONFIG_DIR:-${LME_DIR}/alpaca_eval/judge_configs/deepseek_chat}"
     GEN_SCRIPT="${LME_DIR}/alpaca_eval/generate_alpaca_0507.py"
     VLLM_PY="${VLLM_PY:-python}"
@@ -283,13 +254,16 @@ if [ "${RUN_ALPACA:-1}" = "1" ]; then
         for idx in "${!EVAL_NAMES[@]}"; do
             NAME="${EVAL_NAMES[$idx]}"
             MODEL_PATH="${MODELS_INPUT[$idx]}"
-            OUT_DIR="${OUTPUT_ROOT}/${NAME}/alpaca_${DATE_TAG}"
+            OUT_DIR="${OUTPUT_ROOT}/${NAME}/${ALPACA_SUBDIR}"
             OUT_JSON="${OUT_DIR}/model_outputs.json"
             mkdir -p "${OUT_DIR}/logs"
-            if [ -f "${OUT_JSON}" ]; then
-                echo "[alpaca-skip-gen] ${NAME} (model_outputs.json 已存在)"
-                continue
-            fi
+            # 覆盖语义: 不跳过, 已有 model_outputs.json 会被新一次生成覆盖
+            rm -f "${OUT_JSON}"
+            # Qwen3 chat template 默认开 thinking 模式, 会产出 <think>...</think>
+            # AlpacaEval 不需要思考链, 关闭以避免占用 max_tokens / 误判
+            GEN_EXTRA=()
+            [[ "${NAME}" == *Qwen3* ]] && GEN_EXTRA+=( --enable_thinking False )
+
             acquire_gpu
             GPU_ID=$ACQUIRED_GPU
             echo ">>> [GPU ${GPU_ID}] alpaca-gen ${NAME}"
@@ -303,6 +277,7 @@ if [ "${RUN_ALPACA:-1}" = "1" ]; then
                     --temperature "${GEN_TEMP}" \
                     --top_p "${GEN_TOP_P}" \
                     --max_tokens "${GEN_MAX_TOKENS}" \
+                    "${GEN_EXTRA[@]}" \
                     "${ALPACA_LIMIT_ARGS[@]}" \
                     > "${OUT_DIR}/logs/gen.log" 2>&1
             ) &
@@ -317,23 +292,17 @@ if [ "${RUN_ALPACA:-1}" = "1" ]; then
             echo ">>> AlpacaEval Phase 2: alpaca_eval judge (顺序, DeepSeek API)"
             for idx in "${!EVAL_NAMES[@]}"; do
                 NAME="${EVAL_NAMES[$idx]}"
-                OUT_DIR="${OUTPUT_ROOT}/${NAME}/alpaca_${DATE_TAG}"
+                OUT_DIR="${OUTPUT_ROOT}/${NAME}/${ALPACA_SUBDIR}"
                 OUT_JSON="${OUT_DIR}/model_outputs.json"
                 JUDGE_OUT="${OUT_DIR}/judge"
                 if [ ! -f "${OUT_JSON}" ]; then
                     echo "[alpaca-skip-judge] ${NAME} (没有 model_outputs.json)"
                     continue
                 fi
-                if [ -f "${JUDGE_OUT}/leaderboard.csv" ]; then
-                    echo "[alpaca-skip-judge] ${NAME} (leaderboard.csv 已存在)"
-                    continue
-                fi
+                # 覆盖语义: 整个 judge 目录清空, 避免 alpaca_eval 复用旧 leaderboard 或标注缓存
+                rm -rf "${JUDGE_OUT}"
                 mkdir -p "${JUDGE_OUT}"
                 echo "-> alpaca-judge ${NAME}"
-                # alpaca_eval 的 length-controlled winrate 需要从 HF 下载
-                # tatsu-lab/alpaca_eval/df_gamed.csv, 这里临时取消 HF 离线模式;
-                # 文件首次下载后会缓存到 HF_HOME, 后续仍能离线复用.
-                HF_HUB_OFFLINE=0 HF_DATASETS_OFFLINE=0 TRANSFORMERS_OFFLINE=0 \
                 "${ALPACA_EVAL_BIN}" \
                     --model_outputs "${OUT_JSON}" \
                     --reference_outputs "${REFERENCE_JSON}" \
@@ -346,7 +315,42 @@ if [ "${RUN_ALPACA:-1}" = "1" ]; then
     fi
 fi
 
-# ============ 汇总: lm-eval (json) + AlpacaEval (leaderboard.csv) ============
+# ============================================================================
+# 阶段 2: lm-eval-harness (mmlu / gsm8k / math / humaneval)  —— 后跑
+# ============================================================================
+echo ""
+echo ">>> lm-eval Phase: ${#EVAL_NAMES[@]} 模型 / ${NUM_GPUS} 卡"
+# 进入 lm-eval 阶段前 reset GPU 调度状态 (alpaca 阶段已 wait, 但保险起见)
+for g in "${!GPU_PID[@]}"; do GPU_PID[$g]=0; done
+for idx in "${!EVAL_NAMES[@]}"; do
+    NAME="${EVAL_NAMES[$idx]}"
+    MODEL_PATH="${MODELS_INPUT[$idx]}"
+    OUT_BASE="${EVAL_BASES[$idx]}"
+
+    ARGS="pretrained=${MODEL_PATH}"
+    [[ "${NAME}" == *Qwen3* ]] && ARGS="${ARGS},enable_thinking=False"
+
+    mkdir -p "${OUT_BASE}/logs"
+
+    acquire_gpu
+    GPU_ID=$ACQUIRED_GPU
+    echo ">>> [GPU ${GPU_ID}] ${NAME} → ${MODEL_PATH}  (log: ${OUT_BASE}/logs/*.log)"
+    (
+        [[ -n "${LM_TASKS}" ]] && run_lm "${ARGS}" "${OUT_BASE}" "${GPU_ID}"
+        [[ -n "${GEN_TASKS}" ]] && run_gen 0.0 gen_temp0 "${ARGS}" "${OUT_BASE}" "${GPU_ID}"
+        for ((j=1; j<=GEN_T1_REPEATS; j++)); do
+            run_gen 1.0 "gen_temp1_run${j}" "${ARGS}" "${OUT_BASE}" "${GPU_ID}"
+        done
+    ) &
+    GPU_PID[${GPU_ID}]=$!
+    sleep "${LAUNCH_STAGGER}"
+done
+wait
+echo "[run_models] lm-eval 阶段完成"
+
+# ============================================================================
+# 阶段 3: 汇总 lm-eval (json) + AlpacaEval (leaderboard.csv)
+# ============================================================================
 SUMMARY_CSV="${OUTPUT_ROOT}/eval_summary_${DATE_TAG}.csv"
 SUMMARY_JSON="${OUTPUT_ROOT}/eval_summary_${DATE_TAG}.json"
 
@@ -363,11 +367,12 @@ csv_path, json_path, eval_subdir, alpaca_subdir, *model_paths = sys.argv[1:]
 PREFERRED = [
     "acc,none", "acc_norm,none",
     "exact_match,strict-match", "exact_match,flexible-extract",
-    "exact_match,none",            # hendrycks_math 顶层 / 子任务
-    "pass@1,create_test",          # humaneval / humaneval_instruct
-    "pass@1,none",
+    "exact_match,none",
+    "pass@1,create_test", "pass@1,none",
     "mc2,none", "em,none",
 ]
+
+SKIP_SUBSTR = ("stderr", "sample_len", "alias")
 
 def pick_primary(metrics):
     for k in PREFERRED:
@@ -375,7 +380,7 @@ def pick_primary(metrics):
         if isinstance(v, (int, float)):
             return k, v
     for k, v in metrics.items():
-        if k.endswith("_stderr,none") or "stderr" in k:
+        if any(s in k for s in SKIP_SUBSTR):
             continue
         if isinstance(v, (int, float)):
             return k, v
@@ -451,7 +456,8 @@ for mp in model_paths:
                     target = r
                     break
         if target is not None:
-            for metric_key in ("length_controlled_winrate", "win_rate", "standard_error"):
+            # win_rate 为主报告指标 (LC winrate 仅作参考)
+            for metric_key in ("win_rate", "length_controlled_winrate", "standard_error"):
                 v = target.get(metric_key)
                 if v in (None, ""):
                     continue

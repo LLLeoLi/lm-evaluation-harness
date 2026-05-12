@@ -7,9 +7,27 @@
 import argparse
 import json
 import os
+import re
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
+
+
+THINK_BLOCK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+
+
+def strip_think(text: str) -> str:
+    text = THINK_BLOCK_RE.sub("", text)
+    # 处理被 max_tokens 截断、缺少闭合 </think> 的情况
+    if "<think>" in text and "</think>" not in text:
+        text = text.split("<think>", 1)[0]
+    return text.lstrip()
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    return str(v).lower() in {"1", "true", "yes", "y", "t"}
 
 
 def main():
@@ -25,6 +43,10 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="只跑前 N 条 (调试用)")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.7,
                         help="vLLM 显存占用比例; GPU 已有其他进程时调低 (默认 0.7)")
+    parser.add_argument("--enable_thinking", type=str2bool, default=False,
+                        help="Qwen3 等模型的 chat template thinking 模式; AlpacaEval 应设为 False 以禁用 <think> 链")
+    parser.add_argument("--strip_think", type=str2bool, default=True,
+                        help="生成后剥除残余 <think>...</think> 块 (默认 True, 兜底)")
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in args.device_ids)
@@ -42,10 +64,19 @@ def main():
     )
     tok = AutoTokenizer.from_pretrained(args.model_path)
 
+    # 部分 chat template (如 Qwen3) 支持 enable_thinking 参数; 不支持的模型回退到不传
+    template_kwargs = dict(tokenize=False, add_generation_prompt=True)
+    if not args.enable_thinking:
+        template_kwargs["enable_thinking"] = False
+
     prompts = []
     for item in eval_set:
         msgs = [{"role": "user", "content": item["instruction"]}]
-        prompts.append(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
+        try:
+            prompts.append(tok.apply_chat_template(msgs, **template_kwargs))
+        except TypeError:
+            # tokenizer 不识别 enable_thinking, 退回标准调用
+            prompts.append(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
 
     sp = SamplingParams(
         max_tokens=args.max_tokens,
@@ -56,9 +87,12 @@ def main():
 
     results = []
     for item, out in zip(eval_set, outputs):
+        text = out.outputs[0].text
+        if args.strip_think:
+            text = strip_think(text)
         results.append({
             "instruction": item["instruction"],
-            "output": out.outputs[0].text,
+            "output": text,
             "generator": args.model_name,
             "dataset": item.get("dataset", "alpaca_eval"),
         })
