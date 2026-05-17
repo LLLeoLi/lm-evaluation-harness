@@ -112,7 +112,6 @@ run_eval() {
     mkdir -p "${LOG_DIR}"
 
     local ARGS="pretrained=${MODEL_PATH}"
-    [[ "${MODEL_BASE}" == Qwen3* ]] && ARGS="${ARGS},enable_thinking=False"
 
     echo ">>> [GPU ${GPU}] ${NAME}"
     run_lm  "${ARGS}" "${OUT_DIR}" "${LOG_DIR}" "${NAME}" "${GPU}"

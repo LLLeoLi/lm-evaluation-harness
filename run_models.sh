@@ -8,12 +8,15 @@
 #
 #   执行顺序 (本版本):
 #     1) AlpacaEval (vLLM generate + DeepSeek judge)      —— 先跑
-#     2) lm-eval-harness (mmlu / gsm8k / math / humaneval) —— 后跑
+#     2) lm-eval-harness (mmlu / gsm8k / math500 / humaneval) —— 后跑
 #     3) 汇总 CSV/JSON
 #
-#   任务集 (0507 版本, 与 _run_0507_common.sh 对齐):
-#     LM (loglikelihood, 跑 1 次):           mmlu
-#     GEN (generate_until, T=0 + T=1×N):     gsm8k, hendrycks_math, humaneval_instruct
+#   任务集 (20250516 版本):
+#     LM  (loglikelihood, T=0 单次, with chat template + multiturn):
+#          mmlu
+#     GEN (generate_until, T=0 + T=1, 默认各 1 次, with chat template):
+#          GEN_TASKS      (with --fewshot_as_multiturn): gsm8k, humaneval_instruct
+#          GEN_TASKS_NOMT (without --fewshot_as_multiturn): minerva_math500
 #
 #   用法:
 #     bash run_models.sh <model_path_or_id> [<model_path_or_id> ...]
@@ -21,10 +24,11 @@
 #     bash run_models.sh -f models.txt           # 从文件读, 每行一个模型
 #
 #   可选环境变量:
-#     LM_TASKS         默认 mmlu
-#     GEN_TASKS        默认 gsm8k,hendrycks_math (会自动追加 HUMANEVAL_TASK)
+#     LM_TASKS         默认 mmlu                          (loglikelihood, T=0 单次)
+#     GEN_TASKS        默认 gsm8k                         (会自动追加 HUMANEVAL_TASK; 走 multiturn)
+#     GEN_TASKS_NOMT   默认 minerva_math500               (不走 multiturn; 单独一次 lm_eval 调用)
 #     HUMANEVAL_TASK   默认 humaneval_instruct (base 模型改用 humaneval; 设为 "" 则不跑)
-#     GEN_T1_REPEATS   GEN_TASKS 在 T=1 下重复次数, 默认 3
+#     GEN_T1_REPEATS   GEN_TASKS / GEN_TASKS_NOMT 在 T=1 下重复次数, 默认 1 (即 T=0 + T=1 各 1 次)
 #     BATCH_SIZE_LM    lm_eval --batch_size, 默认 32
 #     RUN_ALPACA       =1 时追加 AlpacaEval 评测 (默认 1, 设 0 跳过)
 #     ALPACA_SKIP_JUDGE =1 时只生成 model_outputs.json, 不调 DeepSeek API judge
@@ -33,7 +37,7 @@
 #     GEN_TEMP/GEN_TOP_P/GEN_MAX_TOKENS  生成采样参数 (默认 0.7 / 1.0 / 512)
 #
 #   输出:
-#     ${OUTPUT_ROOT}/<basename(model)>/${EVAL_SUBDIR}/{lm,gen_temp0,gen_temp1_run1,...}.json
+#     ${OUTPUT_ROOT}/<basename(model)>/${EVAL_SUBDIR}/results_{lm,gen_temp0,gen_temp0_nomt,gen_temp1_run1,gen_temp1_run1_nomt,...}.json
 #     ${OUTPUT_ROOT}/<basename(model)>/${ALPACA_SUBDIR}/{model_outputs.json,judge/}
 #     ${OUTPUT_ROOT}/eval_summary_${DATE_TAG}.{csv,json}
 # ==============================================================================
@@ -72,25 +76,24 @@ mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}"
 # 清理上次中断遗留的 *.incomplete 目录
 find "${HF_DATASETS_CACHE}" -type d -name "*.incomplete" -exec rm -rf {} + 2>/dev/null
 
-DATE_TAG=$(date +%Y%m%d)
+DATE_TAG=20250516
 EVAL_SUBDIR="eval_general_${DATE_TAG}"
 ALPACA_SUBDIR="alpaca_${DATE_TAG}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/hdfs/tiktok_aiic/user/lihao.612/sf_ckpts/_models_eval_general_0507_${DATE_TAG}}"
 
-# ===== 0507 任务划分 =====
-# loglikelihood (mmlu): 默认开启
+# ===== 20250516 任务划分 =====
+# loglikelihood (mmlu): 跑 1 次, 应用 chat template (适配 instruct 模型)
 LM_TASKS="${LM_TASKS:-mmlu}"
-# generate_until: 当前默认只跑 T=0 (GEN_T1_REPEATS=0); 默认任务集包含 gsm8k + hendrycks_math
+# generate_until 拆成两组 (因为 --fewshot_as_multiturn 是全局 flag, 必须分次调用):
+#   GEN_TASKS       : 走 --fewshot_as_multiturn (gsm8k + HUMANEVAL_TASK)
+#   GEN_TASKS_NOMT  : 不走 --fewshot_as_multiturn (minerva_math500)
 # humaneval: instruct 模型用 humaneval_instruct (默认), base 用 humaneval; 空字符串则不跑
 HUMANEVAL_TASK="${HUMANEVAL_TASK-humaneval_instruct}"
-GEN_TASKS="${GEN_TASKS:-gsm8k,hendrycks_math}"
+GEN_TASKS="${GEN_TASKS:-gsm8k}"
 [[ -n "${HUMANEVAL_TASK}" ]] && GEN_TASKS="${GEN_TASKS},${HUMANEVAL_TASK}"
-GEN_T1_REPEATS="${GEN_T1_REPEATS:-0}"
+GEN_TASKS_NOMT="${GEN_TASKS_NOMT:-minerva_math500}"
+GEN_T1_REPEATS="${GEN_T1_REPEATS:-1}"
 BATCH_SIZE_LM="${BATCH_SIZE_LM:-32}"
-
-# humaneval (任一变体) 需要 --confirm_run_unsafe_code
-GEN_EXTRA_ARGS=()
-[[ "${GEN_TASKS}" == *humaneval* ]] && GEN_EXTRA_ARGS+=( --confirm_run_unsafe_code )
 
 # ------------- 解析模型列表 -------------
 MODELS_INPUT=()
@@ -122,31 +125,36 @@ for m in "${MODELS_INPUT[@]}"; do echo "  - $m"; done
 
 cd "${LME_DIR}"
 
-# loglikelihood 任务集 (mmlu), 不传 gen_kwargs
+# loglikelihood 任务集 (mmlu), T=0 单次; 应用 chat template (instruct 模型)
 run_lm() {
     local ARGS=$1 OUT_DIR=$2 GPU=$3
     CUDA_VISIBLE_DEVICES=${GPU} lm_eval --model hf \
         --model_args "${ARGS}" --tasks "${LM_TASKS}" \
+        --apply_chat_template --fewshot_as_multiturn \
         --device cuda:0 --batch_size "${BATCH_SIZE_LM}" \
         --output_path "${OUT_DIR}/results_lm.json" \
         > "${OUT_DIR}/logs/lm.log" 2>&1
 }
 
-# generate_until 任务集 (gsm8k, hendrycks_math, humaneval_instruct), 单一温度配置
+# generate_until 任务: 单一温度配置; 由调用方决定 TASKS / 是否启用 --fewshot_as_multiturn
+# 含 humaneval 时自动追加 --confirm_run_unsafe_code (按本次实际跑的 TASKS 判断)
 run_gen() {
-    local TEMP=$1 SUFFIX=$2 ARGS=$3 OUT_DIR=$4 GPU=$5
+    local TEMP=$1 SUFFIX=$2 ARGS=$3 OUT_DIR=$4 GPU=$5 TASKS=$6 USE_MT=$7
     local GEN_KWARGS
     if [ "${TEMP}" = "0.0" ]; then
         GEN_KWARGS="do_sample=False"
     else
         GEN_KWARGS="temperature=${TEMP},do_sample=True"
     fi
+    local EXTRA_ARGS=()
+    [ "${USE_MT}" = "1" ] && EXTRA_ARGS+=( --fewshot_as_multiturn )
+    [[ "${TASKS}" == *humaneval* ]] && EXTRA_ARGS+=( --confirm_run_unsafe_code )
     CUDA_VISIBLE_DEVICES=${GPU} lm_eval --model hf \
-        --model_args "${ARGS}" --tasks "${GEN_TASKS}" \
-        --apply_chat_template --fewshot_as_multiturn \
+        --model_args "${ARGS}" --tasks "${TASKS}" \
+        --apply_chat_template \
         --device cuda:0 --batch_size "${BATCH_SIZE_LM}" \
         --gen_kwargs "${GEN_KWARGS}" \
-        "${GEN_EXTRA_ARGS[@]}" \
+        "${EXTRA_ARGS[@]}" \
         --output_path "${OUT_DIR}/results_${SUFFIX}.json" \
         > "${OUT_DIR}/logs/${SUFFIX}.log" 2>&1
 }
@@ -259,10 +267,7 @@ if [ "${RUN_ALPACA:-1}" = "1" ]; then
             mkdir -p "${OUT_DIR}/logs"
             # 覆盖语义: 不跳过, 已有 model_outputs.json 会被新一次生成覆盖
             rm -f "${OUT_JSON}"
-            # Qwen3 chat template 默认开 thinking 模式, 会产出 <think>...</think>
-            # AlpacaEval 不需要思考链, 关闭以避免占用 max_tokens / 误判
             GEN_EXTRA=()
-            [[ "${NAME}" == *Qwen3* ]] && GEN_EXTRA+=( --enable_thinking False )
 
             acquire_gpu
             GPU_ID=$ACQUIRED_GPU
@@ -316,7 +321,7 @@ if [ "${RUN_ALPACA:-1}" = "1" ]; then
 fi
 
 # ============================================================================
-# 阶段 2: lm-eval-harness (mmlu / gsm8k / math / humaneval)  —— 后跑
+# 阶段 2: lm-eval-harness (mmlu / gsm8k / math500 / humaneval)  —— 后跑
 # ============================================================================
 echo ""
 echo ">>> lm-eval Phase: ${#EVAL_NAMES[@]} 模型 / ${NUM_GPUS} 卡"
@@ -328,7 +333,6 @@ for idx in "${!EVAL_NAMES[@]}"; do
     OUT_BASE="${EVAL_BASES[$idx]}"
 
     ARGS="pretrained=${MODEL_PATH}"
-    [[ "${NAME}" == *Qwen3* ]] && ARGS="${ARGS},enable_thinking=False"
 
     mkdir -p "${OUT_BASE}/logs"
 
@@ -337,9 +341,13 @@ for idx in "${!EVAL_NAMES[@]}"; do
     echo ">>> [GPU ${GPU_ID}] ${NAME} → ${MODEL_PATH}  (log: ${OUT_BASE}/logs/*.log)"
     (
         [[ -n "${LM_TASKS}" ]] && run_lm "${ARGS}" "${OUT_BASE}" "${GPU_ID}"
-        [[ -n "${GEN_TASKS}" ]] && run_gen 0.0 gen_temp0 "${ARGS}" "${OUT_BASE}" "${GPU_ID}"
+        # T=0 一次
+        [[ -n "${GEN_TASKS}" ]]      && run_gen 0.0 gen_temp0      "${ARGS}" "${OUT_BASE}" "${GPU_ID}" "${GEN_TASKS}"      1
+        [[ -n "${GEN_TASKS_NOMT}" ]] && run_gen 0.0 gen_temp0_nomt "${ARGS}" "${OUT_BASE}" "${GPU_ID}" "${GEN_TASKS_NOMT}" 0
+        # T=1 重复 GEN_T1_REPEATS 次
         for ((j=1; j<=GEN_T1_REPEATS; j++)); do
-            run_gen 1.0 "gen_temp1_run${j}" "${ARGS}" "${OUT_BASE}" "${GPU_ID}"
+            [[ -n "${GEN_TASKS}" ]]      && run_gen 1.0 "gen_temp1_run${j}"      "${ARGS}" "${OUT_BASE}" "${GPU_ID}" "${GEN_TASKS}"      1
+            [[ -n "${GEN_TASKS_NOMT}" ]] && run_gen 1.0 "gen_temp1_run${j}_nomt" "${ARGS}" "${OUT_BASE}" "${GPU_ID}" "${GEN_TASKS_NOMT}" 0
         done
     ) &
     GPU_PID[${GPU_ID}]=$!

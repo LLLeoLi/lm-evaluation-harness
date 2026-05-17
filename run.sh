@@ -212,7 +212,6 @@ for MODEL_PATH in "${MODELS[@]}"; do
     fi
 
     ARGS="pretrained=${EVAL_PATH}"
-    [[ "${NAME}" == *Qwen3* ]] && ARGS="${ARGS},enable_thinking=False"
     OUT_BASE="${HDFS_RUN_DIR}/${NAME}/${EVAL_SUBDIR}"
     mkdir -p "${OUT_BASE}"
     EVAL_BASES+=("${OUT_BASE}")
