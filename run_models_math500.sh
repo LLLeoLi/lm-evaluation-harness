@@ -212,6 +212,7 @@ import csv, json, os, sys
 csv_path, json_path, eval_subdir, *model_paths = sys.argv[1:]
 
 PREFERRED = [
+    "math_verify,none",
     "exact_match,strict-match", "exact_match,flexible-extract",
     "exact_match,none", "acc,none",
 ]
